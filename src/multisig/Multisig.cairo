@@ -3,24 +3,40 @@
 mod Multisig {
 
     use array::ArrayTrait;
-    use starknet::get_caller_address();
+    use starknet::ContractAddress;
+    use starknet::get_tx_info;
+    use starknet::get_caller_address;
+    use starknet::call_contract_syscall;
+    use starknet::VALIDATED;
+    use serde::Serde;
+    use ecdsa::check_ecdsa_signature;
 
+
+    /////Call Struct/////
+    #[derive(Serde, Drop)]
+    struct Transaction {
+        to: ContractAddress,
+        selector: felt252,
+        confirmations: usize,
+        calldata: Array<felt252>,
+        executed: bool,
+    }
+
+    ///STORAGE VALUES///
     struct Storage {
         num_confirmations_required: usize,
-        num_owners: usize;
-        is_owner: LegacyMap<ContractAddress, bool>,
-        // is_confirmed: LegacyMap<ContractAddress, bool>,
+        num_owners: usize,
         //keep transaction count
         prev_tx: felt252,
+        is_owner: LegacyMap<ContractAddress, bool>,
         // track transactions
         tx_info: LegacyMap<felt252, Transaction>,
-        //mapping from tx index => owner => bool
         // approved: LegacyMap<uint, LegacyMap<address, bool>>,
         has_confirmed: LegacyMap<(ContractAddress, felt252), bool>,
     }
 
 
-    ////////////////////EVENTS
+    ////////////////////EVENTS///////////
 
     #[event]
     fn Deposit(sender: ContractAddress, amount: usize, balance: usize) {}
@@ -43,17 +59,6 @@ mod Multisig {
     fn ExecuteTransaction(owner: ContractAddress, txId: usize) {}
 
 
-    struct Transaction {
-        to: ContractAddress,
-        selector: felt252,
-        confirmations: usize,
-        calldata: Array<felt252>,
-        executed: bool,
-    }
-
-
-
-
     #[constructor]
     fn constructor(_confirmations: _usize, _owners: Array<ContractAddress> ){
         // ensure we have more than 1 owner
@@ -73,8 +78,9 @@ mod Multisig {
             match multisig_owners.pop_front() {
                 Option::Some(owner) => {
                     //is it possible to check it is not zero address?
-                    assert(owner.is_not_zero(), 'zero address!')
-                    assert(is_owner::read(contractAddress, false, 'already added!'))
+                    assert(!owner.is_zero(), 'zero address!');
+                    assert(!is_owner::read(contractAddress, 'already added!'));
+
                     is_owner::write(contractAddress, true);
                 },
                 Option::None(()) => {
@@ -127,17 +133,17 @@ mod Multisig {
         assert(has_confirmed::read((caller, tx_index)) != true, 'caller has confirmed transaction!');
 
         //read the transaction from storage
-        let Call{to, selector, confirmations, calldata, executed} = tx_info::read(tx_index);
+        let Transaction{to, selector, confirmations, calldata, executed} = tx_info::read(tx_index);
 
         //assert transaction is valid/exists
         assert(tx_info::read(tx_index) != 0, 'tx does not exist');       
 
         // require confirmations below minimum required
-        assert(Call.confirmations < num_confirmations_required::read(), 'max confirmations required');     
+        assert(Transaction.confirmations < num_confirmations_required::read(), 'max confirmations required');     
 
-        let new_confirmations = Call.confirmations + 1;
+        let new_confirmations = Transaction.confirmations + 1;
 
-        let updated_call = Call{
+        let updated_call = Transaction{
             to: to, 
             selector: selector, 
             confirmations: new_confirmations, 
@@ -165,13 +171,13 @@ mod Multisig {
         assert(tx_index <= prev, 'tx does not exist'); 
 
         //read the transaction from storage
-        let Call{to, selector, confirmations, calldata, executed} = tx_info::read(tx_index);
+        let Transaction{to, selector, confirmations, calldata, executed} = tx_info::read(tx_index);
 
         // require confirmations above minimum required
-        assert(Call.confirmations > num_confirmations_required::read(), 'max confirmations required');  
+        assert(Transaction.confirmations > num_confirmations_required::read(), 'max confirmations required');  
 
         // confirm tx not executed
-        assert(Call.executed == false, 'tx executed already!');
+        assert(Transaction.executed == false, 'tx executed already!');
 
         // make the function call using the low-level call_contract_syscall
         let retdata: Span<felt252> = call_contract_syscall(
@@ -221,6 +227,41 @@ mod Multisig {
 
         RevokeTransaction(caller, txId);
         return();         
+    }
+
+    ////validate_declare__ validates account declare tx - enforces fee payment
+    #[external]
+    fn __validate_declare__(classhash: felt252) -> felt252 {
+        let caller = get_caller_address();
+        let _public_key = owners_pub_keys::read(caller);
+
+        validate_transaction(_public_key)
+    }
+
+    // __validate_deploy__ validates account deploy tx
+    #[external]
+    fn __validate_deploy__(class_hash: felt252,
+                           contract_address_salt: felt252, 
+                           _public_key: felt252) -> felt252 {
+        validate_transaction(_public_key)
+    }
+
+    // validate_transaction internal function that checks transaction signature is valid
+    fn validate_transaction(_public_key: felt252) -> felt252 {
+        let tx_info = get_tx_info().unbox();
+        let signature = tx_info.signature;
+        assert(signature.len() == 2_u32, 'invalid signature length!');
+
+        assert(
+            check_ecdsa_signature(
+                message_hash: tx_info.transaction_hash,
+                public_key: _public_key,
+                signature_r: *signature[0_u32],
+                signature_s: *signature[1_u32],
+            ),
+            'invalid signature!',
+        );
+        VALIDATED
     }
 
 
